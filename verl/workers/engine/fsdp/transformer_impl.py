@@ -82,6 +82,66 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _is_nested_fsdp_state(name: str, nested_fsdp_names: tuple[str, ...]) -> bool:
+    """Return whether ``name`` belongs to a nested FSDP unit."""
+    return any(name == nested_name or name.startswith(f"{nested_name}.") for nested_name in nested_fsdp_names)
+
+
+def _iter_fsdp2_unsharded_state(module, model, device):
+    """Export one FSDP2 unit at a time using its fused unshard operation.
+
+    ``FSDPModule.unshard()`` is intentionally non-recursive. Each iteration
+    therefore materializes only the parameters managed by one fully-shard
+    unit, while parameters owned by nested units remain sharded. The unit is
+    resharded before the next one is materialized, including when the consumer
+    closes the generator early or raises while consuming it.
+    """
+    fsdp_units = [(name, submodule) for name, submodule in module.named_modules() if fsdp_version(submodule) == 2]
+
+    for unit_name, unit in fsdp_units:
+        nested_fsdp_names = tuple(
+            name for name, submodule in unit.named_modules() if name and fsdp_version(submodule) == 2
+        )
+        # Capture persistent-state names before unshard. Calling state_dict()
+        # after unshard runs FSDP hooks that can swap the newly materialized
+        # parameters back to placeholder storage.
+        state_names = tuple(unit.state_dict())
+
+        unit.unshard()
+        try:
+            # Use remove_duplicate=False to preserve tied-weight aliases from
+            # state_dict(), e.g. embed_tokens.weight and lm_head.weight.
+            parameters = dict(unit.named_parameters(recurse=True, remove_duplicate=False))
+            buffers = dict(unit.named_buffers(recurse=True, remove_duplicate=False))
+            unit_state = {}
+
+            # state_dict() supplies the canonical persistent-state ordering,
+            # while named_parameters() exposes the unsharded Parameter objects.
+            for local_name in state_names:
+                if _is_nested_fsdp_state(local_name, nested_fsdp_names):
+                    continue
+
+                is_parameter = local_name in parameters
+                value = parameters.get(local_name, buffers.get(local_name))
+                if value is None:
+                    # Extra state is not a tensor and is not part of rollout
+                    # weight synchronization.
+                    continue
+
+                name = f"{unit_name}.{local_name}" if unit_name else local_name
+                if is_parameter:
+                    if isinstance(value, DTensor):
+                        # Preserve correctness for layouts with an additional
+                        # sharded mesh dimension that remains after FSDP unshard.
+                        value = value.to(device, non_blocking=True).full_tensor()
+                    value = value.to(torch.bfloat16, non_blocking=True)
+                unit_state[name] = value
+
+            yield from convert_weight_keys(unit_state, model).items()
+        finally:
+            unit.reshard()
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -856,8 +916,7 @@ class FSDPEngine(BaseEngine):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
-        # leaves the module half-moved and crashes state_dict() below (#5995). The
-        # per-DTensor .to(device).full_tensor() below still produces GPU tensors.
+        # leaves the module half-moved and crashes state_dict() below (#5995).
         #
         # FSDP2 state_dict() only collects DTensor refs and the generator below already
         # stages each shard lazily via .to(device).full_tensor(), so the whole-shard
@@ -890,17 +949,20 @@ class FSDPEngine(BaseEngine):
                 # materialized while the context is still open (inside the generator).
                 # Materializing after exit silently sends base weights without adapters.
                 return self._merged_lora_per_tensor_param(), None
-        else:
+        elif not _skip_staging:
             params = self.module.state_dict()
 
-        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        if not _skip_staging:
+            params = convert_weight_keys(params, peft_model)
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param and not _skip_staging:
             offload_fsdp_model_to_cpu(self.module)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
-        if peft_config is not None and base_sync_done:
+        if _skip_staging:
+            per_tensor_param = _iter_fsdp2_unsharded_state(self.module, peft_model, get_device_id())
+        elif peft_config is not None and base_sync_done:
             per_tensor_param = params.items()
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy

@@ -22,8 +22,8 @@ with "Attempted to set the storage of a tensor on device 'cpu' to a storage on
 different device 'cuda:0'."
 
 This test rebuilds that exact sequence on a tiny Qwen2 model and asserts:
-  - the post-fix sequence (state_dict only) succeeds and downstream DTensor
-    materialisation still yields GPU tensors,
+  - batched per-FSDP-unit unshard export matches per-DTensor materialisation,
+  - every unit is resharded after export,
   - the pre-fix sequence (load + state_dict) still crashes today (informational;
     the fix is still correct on PyTorch versions that have relaxed this check).
 
@@ -42,6 +42,7 @@ from transformers import AutoModelForCausalLM, Qwen2Config
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fsdp_utils import MixedPrecisionPolicy, apply_fsdp2, load_fsdp_model_to_gpu
+from verl.workers.engine.fsdp.transformer_impl import _iter_fsdp2_unsharded_state
 
 
 def _build_fsdp2_cpu_offload_module(device_mesh):
@@ -69,29 +70,33 @@ def _build_fsdp2_cpu_offload_module(device_mesh):
     return model
 
 
-def _assert_fixed_path_succeeds(device_mesh, rank):
-    """Replay FSDPEngine.get_per_tensor_param's post-fix sequence."""
+def _assert_batched_export_matches_per_tensor_export(device_mesh, rank):
+    """Compare batched FSDP-unit export with the original per-DTensor path."""
     module = _build_fsdp2_cpu_offload_module(device_mesh)
 
     state_dict = module.state_dict()
     assert len(state_dict) > 0, "expected a populated state dict"
 
-    # Verify downstream DTensor materialisation in get_per_tensor_param still
-    # produces GPU tensors -- this is the rationale for skipping the manual load.
     device = get_device_id()
-    materialised = False
+    expected = {}
     for name, param in state_dict.items():
         if isinstance(param, DTensor):
-            full = param.to(device, non_blocking=True).full_tensor()
-            assert full.device.type == get_device_name(), (
-                f"{name}: full_tensor() yielded {full.device.type}, expected {get_device_name()}"
-            )
-            materialised = True
-            break
-    assert materialised, "did not encounter any DTensor in state_dict; FSDP2 sharding may not be active"
+            param = param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16)
+        expected[name] = param
+
+    actual = dict(_iter_fsdp2_unsharded_state(module, module, device))
+
+    assert actual.keys() == expected.keys()
+    for name in expected:
+        torch.testing.assert_close(
+            actual[name], expected[name], msg=lambda msg, param_name=name: f"{param_name}: {msg}"
+        )
+
+    # The export generator must return every unit to its sharded state.
+    assert all(isinstance(param, DTensor) for param in module.parameters())
 
     if rank == 0:
-        print("fixed path: state_dict() + DTensor materialisation succeeded")
+        print("batched FSDP2 export matches per-DTensor export and resharded all units")
 
 
 def _probe_pre_fix_crash(device_mesh, rank):
@@ -123,7 +128,7 @@ def main():
     _, rank, world_size = initialize_global_process_group()
     device_mesh = init_device_mesh(get_device_name(), mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
-    _assert_fixed_path_succeeds(device_mesh, rank)
+    _assert_batched_export_matches_per_tensor_export(device_mesh, rank)
     # _probe_pre_fix_crash(device_mesh, rank)
 
     torch.distributed.barrier()
